@@ -1,0 +1,179 @@
+// If your library .lf files already define the target C {...} block,
+// you can omit a target declaration here. Otherwise, add the same target
+// they use (rp2040 + pololu_3pi_2040_robot).
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+import Line    from "lib/Line.lf"
+import Motors  from "lib/Motors.lf"
+import Display from "lib/Display.lf"
+
+
+// -------------------------------------------------------------------
+// Controller: all inputs/outputs go here (NOT in main).
+// -------------------------------------------------------------------
+reactor TrackFollowController(
+    sample_period: time = 10 ms,
+    calibration_period: time = 5 s, 
+    motor_speed: float = 0.15,   // reasonable starting speed
+    Kp: float = 0.00025         // proportional gain
+) {
+  // === Ports to talk to the Line reactor ===
+  output calibrate: bool;        // drives Line.calibrate
+  output trigger: bool;          // drives Line.trigger
+  input  sensor: uint16_t[5];   // receives Line.reflect (calibrated values)
+
+  // === Ports to talk to the Motors reactor ===
+  output left_power:  float;     // −1.0 .. 1.0
+  output right_power: float;     // −1.0 .. 1.0
+
+  // === Ports to talk to the Display reactor ===
+  // line0: planned steering direction ("LEFT", "RIGHT", "STRAIGHT", etc.)
+  // line1: status text ("CALIBRATING", "FOLLOWING", "STOP", ...)
+  output dir_text:    string;
+  output status_text: string;
+
+  // === Internal timers ===
+  timer tick(0,sample_period );    //define pooling interval
+  timer calibration_done(calibration_period);
+
+  // === Internal state ===
+  state stopped: bool = false;   // true once we decide to stop at end of track
+  state lost_count: int = 0;     // consecutive "no line" readings
+  state last_error: int = 0;     // reserved for PID extension
+
+  // --- Calibration phase ---
+
+  reaction(startup) -> calibrate, status_text {=
+    // Start in calibration mode.
+    lf_set(calibrate, true);
+    lf_set(status_text, "CALIBRATING");
+  =}
+
+  reaction(calibration_done) -> calibrate, status_text {=
+    // After 2 seconds, stop calibrating and start following.
+    lf_set(calibrate, false);
+    lf_set(status_text, "FOLLOWING");
+  =}
+
+  // Periodically ask Line reactor to read sensors.
+  reaction(tick) -> trigger {=
+    lf_set(trigger, true);
+  =}
+
+  // --- Line following + direction display ---
+
+  reaction(sensor) -> left_power, right_power, dir_text {=
+    if (self->stopped) {
+      // Once we've decided to stop, keep motors off.
+      lf_set(left_power,  0.0f);
+      lf_set(right_power, 0.0f);
+      return;
+    }
+
+    uint16_t* s = sensor->value;   // 5 calibrated sensor latest values 
+
+    // Sum of all sensor readings.
+    uint32_t sum = 0;
+    for (int i = 0; i < 5; ++i) {
+      sum += s[i];
+    }
+
+    // --- Detect "no line" / end of track ---
+    if (sum < 50) {
+      // Very little reflected light: likely off the line.
+      if (self->lost_count < 1000) {
+        self->lost_count++;
+      }
+
+      if (self->lost_count > 100) {   // ~1 second at 20 ms period
+        lf_set(left_power,  0.0f);
+        lf_set(right_power, 0.0f);
+        lf_set(dir_text,    "STOP");
+        self->stopped = true;
+      } else {
+        // Temporarily lost: move slowly straight while searching.
+        float v = self->motor_speed * 0.5f;
+        lf_set(left_power,  v);
+        lf_set(right_power, v);
+        lf_set(dir_text,    "SEARCH");
+      }
+      return;
+    } else {
+      // We see the line again; reset lost counter.
+      self->lost_count = 0;
+    }
+
+    // --- Compute line position using weighted average (0..4000) ---
+    uint32_t weighted = 0;
+    for (int i = 0; i < 5; ++i) {
+      weighted += (uint32_t)s[i] * (uint32_t)(i * 1000);
+    }
+
+    int32_t position = (int32_t)(weighted / sum);   // 0 = far left, 4000 = far right
+    int32_t error    = position - 2000;             // 0 = centered
+    self->last_error = error;
+
+    // --- Proportional steering ---
+    float correction = self->Kp * (float)error;
+
+    float left  = self->motor_speed + correction;
+    float right = self->motor_speed - correction;
+
+    // Clamp to [-1.0, 1.0].
+    if (left  >  1.0f) left  =  1.0f;
+    if (left  < -1.0f) left  = -1.0f;
+    if (right >  1.0f) right =  1.0f;
+    if (right < -1.0f) right = -1.0f;
+
+    lf_set(left_power,  left);
+    lf_set(right_power, right);
+
+    // --- LCD direction text ---
+    const char* dir;
+    const int deadband = 150;
+
+    if (error > deadband) {
+      dir = "RIGHT";     // robot will steer right to re-center
+    } else if (error < -deadband) {
+      dir = "LEFT";      // robot will steer left to re-center
+    } else {
+      dir = "STRAIGHT";
+    }
+
+    lf_set(dir_text, dir);
+  =}
+}
+
+// -------------------------------------------------------------------
+// Main: no inputs, no outputs. Just wire hardware to controller.
+// -------------------------------------------------------------------
+main reactor TrackFollowSolution {
+  line   = new Line();
+  motors = new Motors();
+  disp   = new Display();
+
+  // Tune motor_speed and Kp here if desired.
+  ctrl   = new TrackFollowController(
+    motor_speed = 0.10,
+    Kp = 0.00025
+  );
+
+  // Wire controller to Line reactor.
+  ctrl.calibrate -> line.calibrate;
+  ctrl.trigger   -> line.trigger;
+  line.reflect   -> ctrl.sensor;
+
+  // Wire controller to Motors.
+  ctrl.left_power  -> motors.left_power;
+  ctrl.right_power -> motors.right_power;
+
+  // Wire controller to Display.
+  ctrl.dir_text    -> disp.line0;
+  ctrl.status_text -> disp.line1;
+}

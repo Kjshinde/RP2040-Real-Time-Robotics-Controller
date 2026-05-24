@@ -1,0 +1,39 @@
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true,
+  keepalive: true
+}
+main reactor {
+  preamble {=
+   #include "pico/stdlib.h"
+   #include "hardware/gpio.h"
+
+   #define GPIO_PIN_TRIG 25
+  
+   static void* action;
+   static instant_t elapsed_logical_time;
+
+   void gpio_irq_print_state_cb(uint gpio, uint32_t event_mask)
+   {
+    lf_schedule(action,0);
+   }
+
+  =}
+
+  physical action a;
+
+  reaction (startup) -> a{=
+    stdio_init_all();
+    gpio_init(GPIO_PIN_TRIG);
+    gpio_set_irq_enabled_with_callback(GPIO_PIN_TRIG, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_print_state_cb);
+    action = a;
+    =}
+
+  reaction (a){=
+    printf("Logical time lapsed: %lld\n", (lf_time_logical_elapsed() - elapsed_logical_time));
+    elapsed_logical_time = lf_time_logical_elapsed();
+    =}
+}

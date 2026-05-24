@@ -1,0 +1,274 @@
+/* Hilll climb solutiong used for making the robot climb up a ramp
+(v13 - STOP before turn, using simple Motors.lf)
+@author :- Krutyanjay Shinde
+@author :- Aditya Ray */
+
+target C{
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+// required library for robot orientation and movement
+import Accelerometer from "lib/IMU.lf"
+import Tilt from "lib/Tilt.lf"
+import MotorsWithFeedback from "lib/MotorsWithFeedback.lf" // *** USING SIMPLE MOTORS ***
+import Display from "lib/Display.lf"
+import GyroAngle from "lib/IMU.lf"
+import Encoders from "lib/Encoders.lf"
+
+
+
+preamble {=
+  #include <math.h>
+   #include <stdio.h> // For snprintf
+   #include <stdlib.h> // For fabs()
+   #include "pico/time.h" // for sleep_ms
+=}
+main reactor {
+  hillClimb = new HillClimb();
+}
+reactor HillClimb  (
+
+  // *** This is now POWER (0.0 - 1.0), not speed ***
+  climb_speed: float = 0.2, 
+  flat_threshold: float = 2.0,
+  slope_threshold: float = 10.0,
+  sampling_rate: time = 50ms,
+  calib_time: time = 1s,
+  top_delay_time: time = 700 msec, // Time to drive forward
+  pre_turn_delay: time = 500 msec, // *** NEW: Time to STOP before turning ***
+  
+  // *** Parameters from working test file ***
+  turn_power_limit: float = 0.1, // Max power for turning
+  Kp_turn: float = 0.05,
+  turn_threshold: float = 10.0,
+
+  // Flags
+  turning_done: int = 0
+){
+
+  preamble {=
+   // make enumb for better redability
+   enum robot_state{
+     CALIBRATING,           // 0
+     DRIVING_FLAT,          // 1
+     CLIMBING,              // 2
+     MOVING_FORWARD_ON_TOP, // 3
+     STOPPING_BEFORE_TURN,  // 4 *** NEW STATE ***
+     TURNING,               // 5
+     DESCENDING,            // 6
+     FINISHED               // 7
+   };
+  =}
+
+  state s: int = 0;
+  state pitch_offset: float = 0.0;
+  state is_calibrated: bool = false;
+  state target_heading: float = 0.0;
+  state delay_start_time: time = 0; // Renamed from top_delay_start_time
+  
+  state current_pitch: float = 0.0;
+  state current_heading: float = 0.0;
+
+  accel = new Accelerometer();
+  tilt = new Tilt();
+  gyro_angle = new GyroAngle();
+  motors = new MotorsWithFeedback(); // *** USING SIMPLE MOTORS ***
+  display = new Display();
+  encoder = new Encoders();
+
+  timer sampling_timer(0,sampling_rate);
+  // timer cali_timer(calib_time);
+
+  accel.x -> tilt.x
+  accel.y -> tilt.y
+  accel.z -> tilt.z
+
+  encoder.left -> motors.left
+  encoder.right -> motors.right
+
+  // 1. startup reaction
+  reaction(startup) -> display.line0, display.line1 {=
+    // lf_set(display.line0, "Calibrating...");
+    // lf_set(display.line1, "Keep robot flat!");
+    self->s = DRIVING_FLAT;
+    lf_set(display.line0, "Driving flat...");
+
+  =}
+
+  // // 2. This reaction fires *once* after calibration_time
+  // reaction(cali_timer) -> display.line0, display.line1 {=
+  //   if (self->is_calibrated == false) {
+  //   self->pitch_offset =  self->current_pitch;
+  //   self->is_calibrated = true;
+  // }
+  // self->s = DRIVING_FLAT;
+  // lf_set(display.line0, "Driving flat...");
+  // =}
+
+  // 3.. send trigger single to poll the sensors
+  reaction(sampling_timer) -> accel.trigger, gyro_angle.trigger,encoder.trigger {=
+    lf_set(accel.trigger, true);
+    lf_set(gyro_angle.trigger, true);
+    lf_set(encoder.trigger,true);
+    
+  =}
+
+  // 4: Store Pitch Data
+  // reaction(tilt.pitch) {=
+  //   // self->current_pitch = tilt.pitch->value - self->pitch_offset;
+  //   self->current_pitch = tilt.pitch->value;
+  // =}
+  
+  // 5: Store Gyro Data
+  // reaction(gyro_angle.z) {=
+  //   self->current_heading = gyro_angle.z->value;
+  // =}
+
+  // 6: Main Logic
+  // *** Now outputs to motors.left/right_power ***
+  reaction(tilt.pitch, gyro_angle.z) -> display.line0, display.line1, display.line3, motors.left_speed, motors.right_speed{=
+    self->current_pitch = tilt.pitch->value;
+    self->current_heading = gyro_angle.z->value;
+    float calibrated_pitch = self->current_pitch;
+    float current_heading = self->current_heading;
+
+    // if (self->is_calibrated == false) {
+    //   return;
+    // }
+    printf("%d",self->s);
+    // --- FULL STATE MACHINE LOGIC ---
+    if (self->s == DRIVING_FLAT) {
+      static char buffer[16];
+      snprintf(buffer, 16, "Pitch: %.1f", calibrated_pitch);
+      lf_set(display.line1, buffer);
+      
+      if (calibrated_pitch > self->slope_threshold ) {
+        self->s = CLIMBING;
+        lf_set(display.line0, "Climbing...");
+      }
+      lf_set(motors.left_speed, self->climb_speed);
+      lf_set(motors.right_speed, self->climb_speed);
+
+    } else if (self->s == CLIMBING) {
+      static char buffer[16];
+      snprintf(buffer, 16, "Pitch: %.1f", calibrated_pitch);
+      lf_set(display.line1, buffer);
+      
+      if (calibrated_pitch < self->slope_threshold) {
+        self->s = MOVING_FORWARD_ON_TOP;
+        self->delay_start_time = lf_time_logical(); // Start delay timer
+        lf_set(display.line0, "Reached top...");
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      } else {
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      }
+    
+    } else if (self->s == MOVING_FORWARD_ON_TOP) {
+      static char buffer[16];
+      snprintf(buffer, 16, "Pitch: %.1f", calibrated_pitch);
+      lf_set(display.line1, buffer);
+      
+      instant_t now = lf_time_logical();
+      if (now - self->delay_start_time > self->top_delay_time) {
+
+        if (self->turning_done == 0){
+          // *** NEW LOGIC: Go to STOP state ***
+          self->s = STOPPING_BEFORE_TURN;
+          lf_set(display.line0, "Stopping...");
+          self->delay_start_time = lf_time_logical(); // Reset timer for the stop
+          lf_set(motors.left_speed, 0.0);
+          lf_set(motors.right_speed, 0.0);
+        }
+
+        else if (self->turning_done == 1) {
+          self->s = DESCENDING;
+          lf_set(display.line0, "Descending...");
+          lf_set(motors.left_speed, self->climb_speed);
+          lf_set(motors.right_speed, self->climb_speed);
+        }
+      } 
+      else {
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      }
+
+    } else if (self->s == STOPPING_BEFORE_TURN) {
+        // *** NEW STATE ***
+        // Robot is stopped. Wait for pre_turn_delay.
+        lf_set(motors.left_speed, 0.0);
+        lf_set(motors.right_speed, 0.0);
+        lf_set(display.line0, "Stopped.");
+
+        instant_t now = lf_time_logical();
+        if (now - self->delay_start_time > self->pre_turn_delay) {
+            self->s = TURNING;
+            lf_set(display.line0, "Turning...");
+            self->target_heading = current_heading + 180.0;
+        }
+
+    } else if (self->s == TURNING) {
+      
+      // WORKING PROPORTIONAL TURN LOGIC
+      float error = self->target_heading - current_heading;
+      static char h_buf[16];
+      snprintf(h_buf, 16, "Head: %.1f", current_heading);
+      lf_set(display.line0, h_buf);
+      static char e_buf[16];
+      snprintf(e_buf, 16, "Err: %.1f", error);
+      lf_set(display.line1, e_buf);
+
+      if (fabs(error) < self->turn_threshold) {
+        // --- TURN FINISHED ---
+        self->turning_done = 1; // set the flag for truining done
+        self->delay_start_time = lf_time_logical(); // Start delay timer
+        // self->s = DESCENDING;
+        self->s = MOVING_FORWARD_ON_TOP;
+        // lf_set(display.line0, "Descending...");
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+        
+      } else {
+        // --- STILL TURNING ---
+        float turn_power = self->Kp_turn * error;
+
+        if (turn_power > self->turn_power_limit) {
+          turn_power = self->turn_power_limit;
+        }
+        if (turn_power < -self->turn_power_limit) {
+          turn_power = -self->turn_power_limit;
+        }
+
+        // Use the spin direction from the working test file
+        lf_set(motors.left_speed, -turn_power);
+        lf_set(motors.right_speed, turn_power);
+      }
+
+    } else if (self->s == DESCENDING) {
+      static char buffer[16];
+      snprintf(buffer, 16, "Pitch: %.1f", calibrated_pitch);
+      lf_set(display.line1, buffer);
+      
+      if (calibrated_pitch > (-(self->flat_threshold))) {
+        self->s = FINISHED;
+        lf_set(display.line0, "Finished!");
+        lf_set(motors.left_speed, 0.0);
+        lf_set(motors.right_speed, 0.0);
+      } else {
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      }
+      
+    } else if (self->s == FINISHED) {
+      
+      lf_set(motors.left_speed, 0.0);
+      lf_set(motors.right_speed, 0.0);
+      
+    }
+  =}
+}

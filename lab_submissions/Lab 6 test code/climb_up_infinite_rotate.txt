@@ -1,0 +1,184 @@
+/* Hilll climb solutiong used for making the robot climb up a ramp
+(v8 - Correct C Syntax for Port Variables)
+@author :- Krutyanjay Shinde
+@author :- Aditya Ray */
+
+target C{
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+// required library for robot orientation and movement
+import Accelerometer from "lib/IMU.lf"
+import Tilt from "lib/Tilt.lf"
+import MotorsWithFeedback from "lib/MotorsWithFeedback.lf"
+import Encoders from "lib/Encoders.lf"
+import Display from "lib/Display.lf"
+import GyroAngle from "lib/IMU.lf" // For gyro-based turning
+
+preamble {=
+  #include <math.h>
+   #include <stdio.h> // For snprintf
+=}
+
+main reactor  (
+  climb_speed: float = 0.1,
+  flat_threshold: float = 5.0,
+  slope_threshold: float = 10.0,
+  sampling_rate: time = 50ms,
+  calib_time: time = 1s,
+  turn_speed: float = 0.1,
+  top_delay_time: time = 500 msec // Time to drive forward on top
+){
+
+  preamble {=
+   // make enumb for better redability
+   enum robot_state{
+     CALIBRATING,           // 0
+     DRIVING_FLAT,          // 1
+     CLIMBING,              // 2
+     MOVING_FORWARD_ON_TOP, // 3
+     TURNING,               // 4
+     DESCENDING,            // 5
+     FINISHED               // 6
+   };
+  =}
+
+  state s: int = 0;
+  state pitch_offset: float = 0.0;
+  state is_calibrated: bool = false;
+  state target_heading: float = 0.0;
+  state top_delay_start_time: time = 0;
+
+  accel = new Accelerometer();
+  tilt = new Tilt();
+  gyro_angle = new GyroAngle();
+  motors = new MotorsWithFeedback();
+  encoders = new Encoders();
+  display = new Display();
+
+  timer sampling_timer(0,sampling_rate);
+  timer cali_timer(calib_time);
+
+  accel.x -> tilt.x
+  accel.y -> tilt.y
+  accel.z -> tilt.z
+  encoders.left -> motors.left
+  encoders.right -> motors.right
+
+  // 1. startup reaction
+  reaction(startup) -> display.line0, display.line1 {=
+    lf_set(display.line0, "Calibrating...");
+    lf_set(display.line1, "Keep robot flat!");
+  =}
+
+    // 2. This reaction fires *once* after calibration_time
+    reaction(cali_timer) -> display.line0, display.line1 {=
+    self->s = DRIVING_FLAT;
+    lf_set(display.line0, "Driving flat...");
+    lf_set(display.line1, "");
+    =}
+
+  // 3.. send trigger single to poll the sensors
+  reaction(sampling_timer) -> accel.trigger, encoders.trigger, gyro_angle.trigger {=
+    lf_set(accel.trigger, true);
+    lf_set(gyro_angle.trigger, true);
+
+    if(self->s == CLIMBING || self->s == DRIVING_FLAT || self->s == DESCENDING || self->s == MOVING_FORWARD_ON_TOP){
+      lf_set(encoders.trigger,true);
+    }
+  =}
+
+  // 4. main logic
+  reaction(tilt.pitch, gyro_angle.z) -> display.line0, display.line1, motors.left_speed, motors.right_speed {=
+    
+    // *** C SYNTAX FIX: Use 'instance.port->value' ***
+    if (self->is_calibrated == false) {
+      self->pitch_offset = tilt.pitch->value; // BUG FIX
+      self->is_calibrated = true; // (Typo also fixed here)
+      return; // Wait for the calibration timer
+    }
+
+    // After calibration, calculate corrected values
+    float calibrated_pitch = tilt.pitch->value - self->pitch_offset;
+    
+    // *** C SYNTAX FIX: Use 'instance.port->value' ***
+    float current_heading = gyro_angle.z->value; // BUG FIX
+
+    // Display current *calibrated* pitch for debugging
+    char buffer[16];
+    snprintf(buffer, 16, "Pitch: %.1f", calibrated_pitch);
+    lf_set(display.line1, buffer);
+
+    // --- FULL STATE MACHINE LOGIC ---
+    if (self->s == DRIVING_FLAT) {
+      
+      if (calibrated_pitch > self->slope_threshold) {
+        self->s = CLIMBING;
+        lf_set(display.line0, "Climbing...");
+      }
+      lf_set(motors.left_speed, self->climb_speed);
+      lf_set(motors.right_speed, self->climb_speed);
+
+    } else if (self->s == CLIMBING) {
+      
+      if (calibrated_pitch < self->flat_threshold) {
+        self->s = MOVING_FORWARD_ON_TOP;
+        self->top_delay_start_time = lf_time_logical();
+        lf_set(display.line0, "Reached top...");
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      } else {
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      }
+    
+    } else if (self->s == MOVING_FORWARD_ON_TOP) {
+      
+      instant_t now = lf_time_logical();
+      if (now - self->top_delay_start_time > self->top_delay_time) {
+        self->s = TURNING;
+        lf_set(display.line0, "Turning...");
+        self->target_heading = current_heading + 180.0;
+        lf_set(motors.left_speed, self->turn_speed);
+        lf_set(motors.right_speed, -self->turn_speed);
+      } else {
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      }
+
+    } else if (self->s == TURNING) {
+      
+      if (current_heading >= self->target_heading) {
+        self->s = DESCENDING;
+        lf_set(display.line0, "Descending...");
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      } else {
+        lf_set(motors.left_speed, self->turn_speed);
+        lf_set(motors.right_speed, -self->turn_speed);
+      }
+
+    } else if (self->s == DESCENDING) {
+      
+      if (calibrated_pitch < self->flat_threshold) {
+        self->s = FINISHED;
+        lf_set(display.line0, "Finished!");
+        lf_set(motors.left_speed, 0.0);
+        lf_set(motors.right_speed, 0.0);
+      } else {
+        lf_set(motors.left_speed, self->climb_speed);
+        lf_set(motors.right_speed, self->climb_speed);
+      }
+      
+    } else if (self->s == FINISHED) {
+      
+      lf_set(motors.left_speed, 0.0);
+      lf_set(motors.right_speed, 0.0);
+      
+    }
+  =}
+}

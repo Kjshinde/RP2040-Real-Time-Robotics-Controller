@@ -1,0 +1,283 @@
+/**
+ * Display the outputs from the line sensors on the
+ * <a href="https://www.pololu.com/docs/0J86">Pololu 3pi+ 2040 robot</a>. This program spends the
+ * first 10 seconds in calibration mode, during which you should move the robot over the light and
+ * dark areas that you would like it to detect. It then switches into measurement mode and displays
+ * the measured reflectance of the five IR sensors.
+ *
+ * @author Abhi Gundrala
+ * @author Edward A. Lee
+ */
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+import Line from "lib/Line.lf"
+import Display from "lib/Display.lf"
+import Motors from "lib/Motors.lf"
+import GyroAngle from "lib/IMU.lf"
+
+preamble {=
+    typedef enum {
+      eLEFT,
+      eRIGHT,
+      eCENTRE,
+      eDEFAULT
+    } line_type;
+=}
+
+reactor Linedetect(calibration_time: time = 10 s, sample_period: time = 100 ms) {
+  preamble{=
+    #define CALIBRATION false
+    #define MEASUREMENT true
+  =}
+  
+  output detected: line_type
+  output line_detect_state: bool
+  output line0: string
+  output line1: string
+  output line2: string
+
+  timer t(0, sample_period)
+  //timer seconds(0, 1 s)  // Timer used to display seconds.
+  timer end_calibration(calibration_time)
+
+  line = new Line()
+
+  reaction(startup) -> line0, line_detect_state {=
+    lf_set(line0, "CALIBRATING");
+    lf_set(line_detect_state, CALIBRATION);
+  =}
+
+  reaction(end_calibration) -> line.calibrate, line_detect_state {=
+    static char buf[17];
+    lf_set(line.calibrate, false);
+    snprintf(buf, 17, "Caibration Done!!");
+    lf_set(line_detect_state, MEASUREMENT);
+  =}
+
+  reaction(t) -> line.trigger {=
+    lf_set(line.trigger, true);
+  =}
+
+  reaction(line.reflect) -> line0, line1, line2, detected, line_detect_state{=
+    static char buf0[17];
+    static char buf1[17];
+    static char buf2[17];
+
+    line_type danger = eDEFAULT;
+
+    if (line.reflect->value[0] == 1000)
+    {
+      snprintf(buf0, 17, "Left");
+      danger = eLEFT;
+    }
+    else
+    {
+      snprintf(buf0, 17, "");
+    }
+    
+    if ((line.reflect->value[1] == 1000)  || \
+        (line.reflect->value[2] == 1000)  || \
+        (line.reflect->value[3] == 1000))
+    {
+      snprintf(buf1, 17, "Centre");
+      danger = eCENTRE;
+    }
+    else
+    {
+      snprintf(buf1, 17, "");
+    }
+
+    if (line.reflect->value[4] == 1000)
+    {
+      snprintf(buf2, 17, "Right");
+      danger = eRIGHT;
+    }
+    else
+    {
+      snprintf(buf2, 17, "");
+    }
+
+    lf_set(line0, buf0);
+    lf_set(line1, buf1);
+    lf_set(line2, buf2);
+
+    lf_set(detected, danger);
+  =}
+}
+
+reactor Controller (sample_period: time = 100 ms) {
+  preamble{=
+    #include "pico/stdlib.h"
+    #include <math.h>
+
+    #define SPEED_FWD  0.1f
+    #define SPEED_BCK  0.1f
+    #define SPEED_ROTATE 0.1f
+    #define SPEED_STOP 0.0f
+
+    #define RIGHT_ANGLE 90
+    bool update_offset = false; 
+  =}
+
+  timer t(0, sample_period)
+  input calib: bool
+  input line_detect: line_type
+  output fsm_state: string
+  state rotate_offset : float
+  state current_state: int
+
+  angle = new GyroAngle()
+  motor = new Motors()
+
+  logical action FORWARD_CMD
+  logical action STOP_CMD
+  logical action BACKWARD_CMD
+  logical action ROTATE_R_CMD
+  logical action ROTATE_L_CMD
+  logical action UPDATE_OFFSET
+
+   reaction(FORWARD_CMD) -> motor.left_power, motor.right_power{=
+    lf_set(motor.left_power, SPEED_FWD);
+    lf_set(motor.right_power, SPEED_FWD);
+  =}
+
+  reaction(BACKWARD_CMD) -> motor.left_power, motor.right_power{=
+    lf_set(motor.left_power, -SPEED_BCK);
+    lf_set(motor.right_power, -SPEED_BCK);
+  =}
+
+  reaction(ROTATE_R_CMD) -> motor.left_power, motor.right_power{=
+    lf_set(motor.left_power, SPEED_ROTATE);
+    lf_set(motor.right_power, -SPEED_ROTATE);
+  =}
+
+  reaction(ROTATE_L_CMD) -> motor.left_power, motor.right_power{=
+
+    lf_set(motor.left_power, -SPEED_ROTATE);
+    lf_set(motor.right_power, SPEED_ROTATE);
+  =}
+
+  reaction(STOP_CMD) -> motor.left_power, motor.right_power{=
+    lf_set(motor.left_power, SPEED_STOP);
+    lf_set(motor.right_power, SPEED_STOP);
+  =}
+
+  reaction(startup, calib) -> fsm_state, STOP_CMD, FORWARD_CMD {=
+    if (calib->value){
+      lf_schedule(FORWARD_CMD, SEC(5));
+      lf_set(fsm_state, "FORWARD");
+    }
+    else
+    {
+      lf_set(fsm_state, "Calibrating...");
+      lf_schedule(STOP_CMD, 0);  
+    }
+  =}
+
+  reaction(t) -> angle.trigger {=
+    lf_set(angle.trigger, true);
+  =}
+
+  reaction(angle.z, UPDATE_OFFSET){=
+    if (update_offset)
+    {
+      self->rotate_offset = angle.z->value;
+      update_offset = false;
+    }  
+  =}
+
+  initial mode FORWARD {
+    reaction (line_detect) -> AVOID_R, AVOID_L, UPDATE_OFFSET, STOP_CMD, ROTATE_R_CMD, ROTATE_L_CMD, BACKWARD_CMD, FORWARD_CMD, fsm_state {=
+      
+      switch (line_detect -> value)
+      {
+        case eRIGHT: 
+        {
+          lf_schedule(STOP_CMD, 0);
+          lf_schedule(BACKWARD_CMD, SEC(0.5));
+
+          update_offset = true;
+          lf_schedule(UPDATE_OFFSET, SEC(1));
+          lf_schedule(ROTATE_L_CMD, SEC(1));
+          lf_set_mode(AVOID_L);
+          lf_set(fsm_state, "AVOID_L");
+          break;
+        }
+        case eLEFT:
+        {
+          lf_schedule(STOP_CMD, 0);
+          lf_schedule(BACKWARD_CMD, SEC(0.5));
+
+          update_offset = true;
+          lf_schedule(UPDATE_OFFSET, SEC(1));
+          lf_schedule(ROTATE_R_CMD, SEC(1));
+          lf_set_mode(AVOID_R);
+          lf_set(fsm_state, "AVOID_R");
+          break;
+        }
+        case eCENTRE:
+        {
+          lf_schedule(STOP_CMD, 0);
+          lf_schedule(BACKWARD_CMD, SEC(0.5));
+
+          update_offset = true;
+          lf_schedule(UPDATE_OFFSET, SEC(1));
+          lf_schedule(ROTATE_R_CMD, SEC(1));
+          lf_set_mode(AVOID_R);
+          lf_set(fsm_state, "AVOID_R");
+          break;
+        }
+        default: 
+        {
+          lf_schedule(FORWARD_CMD, 0);
+        }
+      }
+    =}
+
+  }
+
+  mode AVOID_R {
+    reaction(angle.z) -> FORWARD, fsm_state, STOP_CMD, FORWARD_CMD {=
+      float turn_ang = angle.z->value - self->rotate_offset;
+
+      if (abs(turn_ang) >= RIGHT_ANGLE) {
+        lf_schedule(STOP_CMD, 0);
+        lf_schedule(FORWARD_CMD, SEC(1));
+        lf_set_mode(FORWARD);
+        lf_set(fsm_state, "FORWARD");
+      }
+    =}
+  }
+
+  mode AVOID_L {
+    reaction(angle.z) -> FORWARD, fsm_state, STOP_CMD, FORWARD_CMD {=
+      float turn_ang = angle.z->value - self->rotate_offset;
+
+      if (abs(turn_ang) >= RIGHT_ANGLE) {
+        lf_schedule(STOP_CMD, 0);
+        lf_schedule(FORWARD_CMD, SEC(1));
+        lf_set_mode(FORWARD);
+        lf_set(fsm_state, "FORWARD");
+      }
+    =}
+  }
+}
+
+main reactor {
+  line_detect = new Linedetect()
+  controller = new Controller()
+  disp = new Display()
+
+  line_detect.line0, line_detect.line1, line_detect.line2 -> disp.line0, disp.line1, disp.line2
+  line_detect.line_detect_state -> controller.calib
+  line_detect.detected -> controller.line_detect
+
+  controller.fsm_state -> disp.line3
+
+}

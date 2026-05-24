@@ -1,0 +1,28 @@
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true,
+  keepalive: true
+}
+main reactor {
+  preamble {=
+   #include "pico/stdlib.h"
+   #include "hardware/gpio.h"
+
+   #define GPIO_PIN_TRIG 25
+
+   void gpio_irq_print_state_cb(uint gpio, uint32_t event_mask)
+   {
+    printf("GPIO: %d\nEVENT_MASK: %d\n", gpio, event_mask);
+   }
+
+  =}
+
+  reaction (startup) {=
+    stdio_init_all();
+    gpio_init(GPIO_PIN_TRIG);
+    gpio_set_irq_enabled_with_callback(GPIO_PIN_TRIG, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_print_state_cb);
+    =}
+}

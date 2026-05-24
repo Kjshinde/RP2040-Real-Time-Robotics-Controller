@@ -1,0 +1,562 @@
+/* Hilll climb solutiong used for making the robot climb up a ramp
+(v13 - STOP before turn, using simple Motors.lf)
+@author :- Krutyanjay Shinde
+@author :- Aditya Ray */
+
+target C{
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+// required library for robot orientation and movement
+import Accelerometer from "lib/IMU.lf"
+import Display from "lib/Display.lf"
+import GyroAngle from "lib/IMU.lf"
+import Line from "lib/Line.lf"
+import Display from "lib/Display.lf"
+import MotorsWithFeedback from "lib/MotorsWithFeedback.lf"
+import Encoders from "lib/Encoders.lf"
+import Tilt from "lib/Tilt.lf"
+
+
+preamble {=
+  #include <math.h>
+  #include <stdio.h> // For snprintf
+  #include <stdlib.h> // For fabs()
+  #include "pico/time.h" // for sleep_ms
+  typedef enum {
+    eLEFT,
+    eRIGHT,
+    eCENTRE,
+    eDEFAULT
+  } line_type;
+=}
+
+reactor Linedetect(calibration_time: time = 10 s, sample_period: time = 100 ms) {
+  preamble{=
+    #define CALIBRATION false
+    #define MEASUREMENT true
+  =}
+  
+  output detected: line_type
+  output line_detect_state: bool
+  output line0: string
+  output line1: string
+  output line2: string
+  output line3: string
+
+  timer t(0, sample_period)
+  timer end_calibration(calibration_time)
+
+  line = new Line()
+
+  reaction(startup) -> line0, line_detect_state {=
+    lf_set(line0, "CALIBRATING");
+    lf_set(line_detect_state, CALIBRATION);
+  =}
+
+  reaction(end_calibration) -> line.calibrate, line_detect_state, line3 {=
+    static char buf[17];
+    lf_set(line.calibrate, false);
+    snprintf(buf, 17, "Caibration Done!!");
+    lf_set(line3, buf);
+    lf_set(line_detect_state, MEASUREMENT);
+  =}
+
+  reaction(t) -> line.trigger {=
+    lf_set(line.trigger, true);
+  =}
+
+  reaction(line.reflect) -> line0, line1, line2, detected, line_detect_state{=
+    static char buf0[17];
+    static char buf1[17];
+    static char buf2[17];
+
+    line_type danger = eDEFAULT;
+
+    if (line.reflect->value[0] == 1000)
+    {
+      snprintf(buf0, 17, "Left");
+      danger = eLEFT;
+    }
+    else
+    {
+      snprintf(buf0, 17, "");
+    }
+    
+    if ((line.reflect->value[1] == 1000)  || \
+        (line.reflect->value[2] == 1000)  || \
+        (line.reflect->value[3] == 1000))
+    {
+      snprintf(buf1, 17, "Centre");
+      danger = eCENTRE;
+    }
+    else
+    {
+      snprintf(buf1, 17, "");
+    }
+
+    if (line.reflect->value[4] == 1000)
+    {
+      snprintf(buf2, 17, "Right");
+      danger = eRIGHT;
+    }
+    else
+    {
+      snprintf(buf2, 17, "");
+    }
+
+    lf_set(line0, buf0);
+    lf_set(line1, buf1);
+    lf_set(line2, buf2);
+
+    lf_set(detected, danger);
+  =}
+}
+
+reactor Controller (
+  sample_period: time = 10 ms,  
+  // Distances (Meters)
+  d1_distance: float = 0.15, // Distance to drive after reaching top
+  d2_distance: float = 0.20, // Distance to drive after turning (approach descent)
+
+  // Thresholds
+  flat_threshold: float = 2.0,
+  slope_threshold: float = 5.0,
+  roll_threshold: float = 1.0,
+  
+  // Timing
+  sampling_rate: time = 50ms,
+  calib_time: time = 1s,
+  pre_turn_delay: time = 500 msec,
+
+  // Turn Parameters
+  turn_speed_limit: float = 0.1, // m/s limit for MotorsWithFeedback
+  Kp_turn: float = 0.01,        // Gain for Heading Error -> Speed
+  Kp_roll: float = 0.01,
+  turn_threshold: float = 1
+) {
+  preamble{=
+    #include "pico/stdlib.h"
+    #include <math.h>
+
+    #define SPEED_FWD  0.1f
+    #define SPEED_BCK  0.2f
+    #define SPEED_ROTATE 0.1f
+    #define SPEED_STOP 0.0f
+
+    #define SPEED_CLIMB 0.1f
+
+    #define RIGHT_ANGLE 30
+    #define TURN_ANGLE 180
+    bool update_offset = false;
+    bool pause_climb = false;
+    float raw_pitch = 0;
+    float turn_error = 0; 
+
+    enum robot_state{
+      CALIBRATING,          // 0
+      DRIVING_FLAT,         // 1
+      CLIMBING,             // 2
+      MOVING_FORWARD_ON_TOP,// 3
+      TURNING,              // 4
+      DESCENDING,           // 5
+      FINISHED              // 6
+    };
+
+    // Encoder conversion
+    // Wheel diameter = 32mm (0.032m)
+    // Counts per rev = 360 (approx for 30:1 HP motors)
+    // Distance per tick = (Pi * 0.032) / 360
+    #define METERS_PER_TICK 0.00027925
+  =}
+
+  timer t(0, sample_period)
+
+  input calib: bool
+  input line_detect: line_type
+
+  output fsm_state: string
+  output line0: string
+  output line1: string
+  output line2: string
+
+  state rotate_offset : float
+  state current_state: int
+
+  state s: int = 0;
+  state pitch_offset: float = 0.0;
+  state is_calibrated: bool = false;
+  state target_heading: float = 0.0;
+  
+  // State variables for delay timers
+  state turning_done: int = 0;
+  state robot_setup_delay: time = 5s
+
+  // State variables for Distance tracking
+  state start_left_enc: int32_t = 0;
+  state start_right_enc: int32_t = 0;
+  state dist_measurement_active: bool = false;
+
+  state current_pitch: float = 0.0;
+  state current_heading: float = 0.0;
+  state current_roll: float = 0.0;
+
+  angle = new GyroAngle()
+  motors = new MotorsWithFeedback() 
+  encoder = new Encoders()
+  accel = new Accelerometer()
+  tilt = new Tilt()
+  //disp = new Display()
+
+  accel.x, accel.y, accel.z -> tilt.x, tilt.y, tilt.z
+  encoder.left -> motors.left
+  encoder.right -> motors.right
+
+  logical action STOP_CMD
+  logical action CLIMB_CMD
+  logical action FORWARD_CMD
+  logical action BACKWARD_CMD
+  logical action ROTATE_R_CMD
+  logical action ROTATE_L_CMD
+  logical action TURN_CMD
+
+  logical action UPDATE_OFFSET
+
+  reaction(startup, calib) -> fsm_state, STOP_CMD, FORWARD_CMD {=
+    if (calib->value){
+      self->pitch_offset = raw_pitch;
+      lf_set(fsm_state, "DRIVING_FLAT");
+      self->s = DRIVING_FLAT;  
+    }
+    else
+    {
+      lf_set(fsm_state, "Calibrating...");
+      self->s = CALIBRATING;
+      lf_schedule(STOP_CMD, 0);  
+    }
+  =}
+
+  reaction(FORWARD_CMD) -> motors.left_speed, motors.right_speed{=
+    lf_set(motors.left_speed, SPEED_FWD);
+    lf_set(motors.right_speed, SPEED_FWD);
+  =}
+
+  reaction(BACKWARD_CMD) -> motors.left_speed, motors.right_speed{=
+    lf_set(motors.left_speed, -SPEED_BCK);
+    lf_set(motors.right_speed, -SPEED_BCK);
+  =}
+
+  reaction(ROTATE_R_CMD) -> motors.left_speed, motors.right_speed{=
+    lf_set(motors.left_speed, SPEED_ROTATE);
+    lf_set(motors.right_speed, -SPEED_ROTATE);
+  =}
+
+  reaction(ROTATE_L_CMD) -> motors.left_speed, motors.right_speed{=
+    lf_set(motors.left_speed, -SPEED_ROTATE);
+    lf_set(motors.right_speed, SPEED_ROTATE);
+  =}
+
+  reaction(TURN_CMD) -> motors.left_speed, motors.right_speed{=
+    float turn_speed = self->Kp_turn * turn_error;
+
+    if (turn_speed > self->turn_speed_limit) turn_speed = self->turn_speed_limit;
+    if (turn_speed < -self->turn_speed_limit) turn_speed = -self->turn_speed_limit;
+
+    lf_set(motors.left_speed, -turn_speed);
+    lf_set(motors.right_speed, turn_speed);
+  =}
+
+  reaction(STOP_CMD) -> motors.left_speed, motors.right_speed{=
+    lf_set(motors.left_speed, SPEED_STOP);
+    lf_set(motors.right_speed, SPEED_STOP);
+  =}
+
+  // Wiring: Triggers
+  reaction(t) -> accel.trigger, angle.trigger, encoder.trigger {=
+    lf_set(accel.trigger, true);
+    lf_set(angle.trigger, true);
+    lf_set(encoder.trigger, true);
+  =}
+
+  reaction(angle.z, UPDATE_OFFSET){=
+    if (update_offset)
+    {
+      self->rotate_offset = angle.z->value;
+      update_offset = false;
+    }  
+  =}
+
+  // 2. Sensor Processing (Pitch & Heading)
+  reaction(tilt.pitch, tilt.roll, angle.z) -> line1{=
+    static char buf0[16];
+    static char buf1[16];
+    static char buf2[16];
+    // Store Heading
+    self->current_pitch = tilt.pitch->value;
+    self->current_heading = angle.z->value;
+    self->current_roll = tilt.roll->value;
+    
+  =}
+
+  initial mode FORWARD {
+    logical action PAUSE_CLIMB
+    
+    reaction(t, encoder.left, encoder.right, PAUSE_CLIMB) -> fsm_state, UPDATE_OFFSET, FORWARD_CMD, STOP_CMD, ROTATE_L_CMD, TURN_CMD, motors.left_speed, motors.right_speed{=
+      if (!pause_climb)
+      {
+        float calibrated_pitch = self->current_pitch;
+        float current_heading = self->current_heading;
+
+        // Get current encoder values
+        int32_t current_l = encoder.left->value;
+        int32_t current_r = encoder.right->value;
+
+        printf("%d", self->s);
+
+        // --- CLIMB FSM LOGIC ---
+        switch (self->s)
+        {
+          case DRIVING_FLAT: 
+          {
+            // static char buffer[16];
+            // snprintf(buffer, 16, "Pitch: %.1f", calibrated_pitch);
+            // lf_set(disp.line1, buffer);
+
+            if (calibrated_pitch > self->slope_threshold ) {
+              self->s = CLIMBING;
+              lf_set(fsm_state, "Climbing...");
+            }
+
+            lf_set(fsm_state, "DRIVING_FLAT");
+            lf_schedule(FORWARD_CMD, 0);
+            break;
+          }
+
+          case CLIMBING:
+          {
+            // static char buffer[16];
+            // snprintf(buffer, 16, "Pitch: %.1f", calibrated_pitch);
+            // lf_set(disp.line1, buffer);
+
+            if (calibrated_pitch < self->slope_threshold) {
+              // Reached Top -> Start Driving Forward (D1)
+              self->s = MOVING_FORWARD_ON_TOP;
+              lf_set(fsm_state, "Reached top...");
+              
+              // Capture start encoders for distance measurement
+              self->start_left_enc = current_l;
+              self->start_right_enc = current_r;
+              self->dist_measurement_active = true;
+            }
+
+            float adjust = 0.0;
+            if ((fabs(self->current_roll) > self-> roll_threshold)) 
+            {
+              adjust = self->Kp_roll * self->current_roll;
+            }
+            lf_set(motors.left_speed, SPEED_CLIMB + adjust);
+            lf_set(motors.right_speed, SPEED_CLIMB - adjust);
+
+            lf_set(fsm_state, "CLIMBING");
+            break;
+          }
+
+          case MOVING_FORWARD_ON_TOP: 
+          {
+            // Logic: Drive forward until distance target is met
+            // 1. Calculate Distance Traveled
+            float dist_l = (float)(current_l - self->start_left_enc) * METERS_PER_TICK;
+            float dist_r = (float)(current_r - self->start_right_enc) * METERS_PER_TICK;
+            float avg_dist = (fabs(dist_l) + fabs(dist_r)) / 2.0;
+
+            // 2. Determine Target Distance (D1 or D2)
+            float target_d = (self->turning_done == 0) ? self->d1_distance : self->d2_distance;
+
+            // 3. Check Condition
+            if (avg_dist >= target_d) {
+              // Distance Goal Reached
+              
+              if (self->turning_done == 0) {
+                // Finished D1 -> Stop before turn
+                lf_schedule(STOP_CMD, 0);
+                self->s = TURNING;
+                lf_set(fsm_state, "Turning");
+                self->target_heading = current_heading + TURN_ANGLE;
+              } else {
+                if (calibrated_pitch < -self->slope_threshold)
+                {
+                  // Start Descending
+                  self->s = DESCENDING;
+                  lf_set(fsm_state, "Descending...");
+                }
+                else
+                {
+                  lf_schedule(FORWARD_CMD, 0);
+                }
+              }
+            } 
+            // Keep Driving
+            lf_set(fsm_state, "MOVING_FORWARD_ON_TOP");
+            lf_schedule(FORWARD_CMD, 0);
+            break;
+          }
+
+          case TURNING: 
+          {
+            turn_error = self->target_heading - current_heading;
+            float turn_ang = self->current_heading - self->rotate_offset;
+            
+            if (fabs(turn_error) < self->turn_threshold) {
+              // --- TURN FINISHED ---
+              self->turning_done = 1;
+              lf_schedule(STOP_CMD, 0);
+              // Transition to D2 logic
+              self->s = MOVING_FORWARD_ON_TOP;
+              lf_set(fsm_state, "Approach Edge");
+              
+              // Reset Encoders for D2 measurement
+              self->start_left_enc = current_l;
+              self->start_right_enc = current_r;
+              
+            } 
+            else {
+              // --- STILL TURNING ---
+              // Note: MotorsWithFeedback inputs are SPEED (m/s), not power
+              lf_schedule(TURN_CMD, 0);
+            }
+            lf_set(fsm_state, "TURNING");
+            break;
+          }
+
+          case DESCENDING:
+          {
+            if (calibrated_pitch > (-(self->flat_threshold))) {
+              self->s = FINISHED;
+              lf_set(fsm_state, "Finished!");
+            }
+
+            float adjust = 0.0;
+            if ((fabs(self->current_roll) > self-> roll_threshold)) 
+            {
+              adjust = self->Kp_roll * self->current_roll;
+            }
+            lf_set(motors.left_speed, SPEED_CLIMB - adjust);
+            lf_set(motors.right_speed, SPEED_CLIMB + adjust);
+
+            lf_set(fsm_state, "DESCENDING");
+            break;
+          }
+
+          case FINISHED:
+          {
+            lf_set(fsm_state, "FINISHED");
+            lf_schedule(STOP_CMD, 0);
+            break;
+          }
+
+          default: 
+          {
+            
+          }
+        } // switch case
+      }//  PAUSE_CLIMB
+    =}
+
+    reaction (line_detect, calib) -> AVOID_R, AVOID_L, PAUSE_CLIMB, UPDATE_OFFSET, STOP_CMD, ROTATE_R_CMD, ROTATE_L_CMD, BACKWARD_CMD, FORWARD_CMD, fsm_state {=
+      if (calib-> value){
+        if (line_detect -> value != eDEFAULT)
+        {
+          lf_schedule(PAUSE_CLIMB, 0);
+          pause_climb = true;
+        }
+          switch (line_detect -> value)
+          {
+            case eRIGHT: 
+            {
+              lf_schedule(BACKWARD_CMD, SEC(0.5));
+              
+              update_offset = true;
+              lf_schedule(UPDATE_OFFSET, SEC(1));
+              lf_schedule(ROTATE_L_CMD, SEC(1));
+              lf_set_mode(AVOID_L);
+              lf_set(fsm_state, "AVOID_L");
+              break;
+            }
+            case eLEFT:
+            {
+              lf_schedule(BACKWARD_CMD, SEC(0.5));
+              update_offset = true;
+              lf_schedule(UPDATE_OFFSET, SEC(1));
+              lf_schedule(ROTATE_R_CMD, SEC(1));
+              lf_set_mode(AVOID_R);
+              lf_set(fsm_state, "AVOID_R");
+              break;
+            }
+            case eCENTRE:
+            {
+              lf_schedule(BACKWARD_CMD, SEC(0.5));
+              update_offset = true;
+              lf_schedule(UPDATE_OFFSET, SEC(1));
+              lf_schedule(ROTATE_R_CMD, SEC(1));
+              lf_set_mode(AVOID_R);
+              lf_set(fsm_state, "AVOID_R");
+              break;
+            }
+            default: 
+            {
+              pause_climb = false;
+            }
+          }
+        // }
+        
+      }
+    =}
+
+  }
+
+  mode AVOID_R {
+    reaction(angle.z, calib) -> history(FORWARD), fsm_state, STOP_CMD, FORWARD_CMD {=
+      float turn_ang = angle.z->value - self->rotate_offset;
+
+      if (abs(turn_ang) >= RIGHT_ANGLE) {
+        lf_schedule(STOP_CMD, 0);
+        //lf_schedule(FORWARD_CMD, SEC(1));
+        lf_set_mode(FORWARD);
+        lf_set(fsm_state, "FORWARD");
+        pause_climb = false;
+      }
+    =}
+  }
+
+  mode AVOID_L {
+    reaction(angle.z) -> history(FORWARD), fsm_state, STOP_CMD, FORWARD_CMD {=
+      
+      float turn_ang = angle.z->value - self->rotate_offset;
+
+      if (abs(turn_ang) >= RIGHT_ANGLE) {
+        lf_schedule(STOP_CMD, 0);
+        //lf_schedule(FORWARD_CMD, SEC(1));
+        lf_set_mode(FORWARD);
+        lf_set(fsm_state, "FORWARD");
+        pause_climb = false;
+      }
+    =}
+  }
+}
+
+main reactor {
+  line_detect = new Linedetect()
+  controller = new Controller()
+  disp = new Display()
+
+  line_detect.line0, line_detect.line1, line_detect.line1 -> disp.line0, disp.line1, disp.line2
+  line_detect.line_detect_state -> controller.calib after 5sec
+  line_detect.detected -> controller.line_detect
+
+  controller.fsm_state -> disp.line3
+
+}

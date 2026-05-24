@@ -1,0 +1,31 @@
+target C {
+    platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+    single-threaded: true
+}
+preamble {=
+  #include <math.h>
+=}
+reactor Tilt {
+    
+    input x: float
+    input y: float
+    input z: float
+
+    output pitch: float
+    output roll: float
+
+    reaction(x,y,z) -> pitch, roll{=
+        float pitch_ = asinf(x->value);
+        float roll_ = atan2f(-(y->value), z->value);
+
+        // convert to degrees
+        float roll_deg  = roll_  * (float)180 / M_PI;
+        float pitch_deg = pitch_ * (float)180 / M_PI;
+        
+        lf_set (pitch, pitch_deg);
+        lf_set (roll, roll_deg);
+    =}
+}

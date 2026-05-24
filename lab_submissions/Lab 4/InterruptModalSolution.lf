@@ -1,0 +1,109 @@
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true,
+  keepalive: true
+}
+
+import Display from "lib/Display.lf"
+
+preamble {=
+  #include <stdio.h>
+  #include <pico/stdlib.h>
+  #include <hardware/gpio.h>
+=}
+
+main reactor {
+  // Preamble for C code specific to this reactor.
+  preamble {=
+    // Button A on the Pololu robot is on GPIO 15.
+    #define BUTTON_A_PIN 25
+
+    // Static pointer to hold the physical action trigger.
+    static void* action_ptr;
+    // Static variable for debouncing the button.
+    static instant_t last_press_time = 0;
+
+    // This is the C callback function that runs when the button is pressed.
+    void gpio_irq_callback(uint gpio, uint32_t event_mask) {
+      // Debounce: Only schedule an action if more than 200ms have passed.
+      if ((lf_time_physical_elapsed() - last_press_time) > MSEC(200)) {
+        last_press_time = lf_time_physical_elapsed();
+        lf_schedule(action_ptr, 0);
+      }
+    }
+  =}
+
+  // Physical action triggered by the C interrupt callback.
+  physical action button_press;
+  
+  // State variable to hold the current count.
+  state counter: int = 0
+  // Instance of the Display reactor.
+  d = new Display()
+  
+  reaction (startup) -> button_press {=
+    stdio_init_all();
+    
+    // Initialize the GPIO pin for the button.
+    gpio_init(BUTTON_A_PIN);
+    // Enable the internal pull-up resistor.
+    gpio_pull_up(BUTTON_A_PIN);
+    
+    // Register the callback function to be called on a falling edge (button press).
+    gpio_set_irq_enabled_with_callback(
+      BUTTON_A_PIN,
+      GPIO_IRQ_EDGE_FALL,
+      true,
+      &gpio_irq_callback
+    );
+    
+    // Access the action trigger using the compiler-generated name.
+    action_ptr = &self->_lf_button_press;
+  =}
+
+  // Initial mode: counting up.
+  initial mode INC {
+    // Timer to increment the counter every 1 second.
+    timer t_up(0, 1 sec)
+
+    reaction (t_up) -> d.line0 {=
+      static char buff[17];
+      // Using a known-good format string style.
+      snprintf(buff, 17, "INC: %8d", self->counter);
+      lf_set(d.line0, buff);
+      self->counter++;
+    =}
+
+    // When the button is pressed, transition to the DEC mode using lf_set_mode().
+    reaction (button_press) -> reset(DEC) {=
+      lf_set_mode(DEC);
+    =}
+  }
+
+  // Second mode: counting down.
+  mode DEC {
+    // Timer to decrement the counter every 2 seconds (half the rate).
+    timer t_down(0, 2 sec)
+
+    reaction (t_down) -> d.line0 {=
+      static char buff[17];
+      // Using a known-good format string style.
+      snprintf(buff, 17, "DEC: %8d", self->counter);
+      lf_set(d.line0, buff);
+      
+      // Prevent the counter from going below zero.
+      if (self->counter > 0) {
+        self->counter--;
+      }
+    =}
+
+    // When the button is pressed, transition back to the INC mode using lf_set_mode().
+    reaction (button_press) -> reset(INC) {=
+      lf_set_mode(INC);
+    =}
+  }
+}
+
