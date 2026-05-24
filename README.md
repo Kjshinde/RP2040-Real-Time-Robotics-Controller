@@ -1,47 +1,101 @@
-# Autonomous Robot Control System
-### Firmware for Pololu 3pi+ 2040 using Lingua Franca
+# RP2040 Real-Time Robotics Controller
 
-This repository contains the source code for an autonomous mobile robot system developed for the Raspberry Pi RP2040 (ARM Cortex-M0+). The project focuses on high-precision navigation, sensor fusion, and reactive control using the Lingua Franca coordination language.
+Lingua Franca firmware labs for the Pololu 3pi+ 2040 robot, developed as part of Arizona State University embedded systems coursework. The repository keeps the original course deliverables, but is organized like a small robotics firmware project: source files, reports, packaged submissions, and working notes are separated by lab.
 
-## 🚀 Key Features
-* **Autonomous Hill Climbing:** Uses real-time accelerometer and gyroscope feedback to navigate 15° inclines while maintaining orientation.
-* **Precise Navigation:** Implements quadrature encoder-based dead reckoning to execute exact square-path trajectories and 90° turns.
-* **Intelligent Obstacle Avoidance:** Multi-modal behavior handling using tactile bump sensors and infrared reflectance sensors.
-* **Bare-Metal Performance:** Direct Memory-Mapped I/O (MMIO) register manipulation for low-latency hardware control.
-* **Deterministic Execution:** Built on a reactor-based architecture to ensure predictable timing for all control loops.
+## Project Scope
 
+This work explores real-time robot control on the Raspberry Pi RP2040 using Lingua Franca reactors and C interop. Across the top-level lab modules, the robot exercises GPIO control, direct peripheral access, sensor polling, interrupt-driven behavior, line sensing, motor control, IMU-based orientation, and autonomous navigation routines.
 
+Key implemented behaviors include:
 
-## 🛠 Tech Stack
-* **Language:** C, Lingua Franca (LF)
-* **Hardware:** Pololu 3pi+ 2040 (RP2040, Dual-core ARM Cortex-M0+)
-* **Sensors:** ST LSM6DSO 6-axis IMU, Quadrature Encoders, IR Line Sensors
-* **Toolchain:** CMake, GCC Arm Embedded Toolchain, `picotool`
+- LED and serial output exercises for RP2040 toolchain bring-up.
+- IMU tilt measurement using accelerometer data and LCD feedback.
+- GPIO and memory-mapped I/O examples for low-level peripheral control.
+- Interrupt callback, debounce, physical action, and modal behavior examples.
+- Line detection and avoidance using the 3pi+ reflectance sensors.
+- Hill-climb and track-following controllers using motor, encoder, gyro, and line sensor feedback.
 
-## 📂 Project Structure
-* `/src`: Main application logic for robot missions (Square, Hill Climb, Line Following).
-* `/src/lib`: Reusable drivers and reactor components for motors, IMU, and encoders.
-* `/bin`: Compiled binary files (UF2/ELF) for flashing to the RP2040.
+## Hardware And Tooling
 
-## ⚙️ Software Architecture
-The system is designed using **Modal State Machines**, allowing the robot to switch behaviors dynamically:
-1. **DRIVING:** Default state for forward progress using speed control.
-2. **AVOIDING:** Triggered by bump sensors; executes a backup and re-orientation sequence.
-3. **CALIBRATING:** Initial state for IR sensor normalization.
+- Hardware: Pololu 3pi+ 2040 robot with RP2040 microcontroller.
+- Language: Lingua Franca with embedded C reactions.
+- Platform target: `rp2040` / `pololu_3pi_2040_robot`.
+- Typical tools: Lingua Franca compiler, Pico SDK, CMake, Arm GCC toolchain, and `picotool`.
+- Sensors and actuators: LSM6DSO IMU, quadrature encoders, IR line sensors, push buttons, LCD, LEDs, and differential drive motors.
 
+## Repository Layout
 
+```text
+.
+|-- lab-01-tools/
+|   |-- src/
+|   |-- report/
+|   `-- submission/
+|-- lab-02-sensors/
+|   |-- src/
+|   |-- report/
+|   `-- submission/
+|-- lab-03-peripherals/
+|   |-- src/
+|   |-- report/
+|   `-- submission/
+|-- lab-04-interrupts/
+|   |-- src/
+|   |-- report/
+|   `-- submission/
+|-- lab-06-hill-climb/
+|   |-- src/
+|   |-- report/
+|   |-- submission/
+|   `-- notes/
+|-- lab-07-line-tracking/
+|   |-- src/
+|   |-- report/
+|   `-- submission/
+`-- README.md
+```
 
-## 🔗 Hardware Documentation (Pololu 3pi+)
-* [Pololu 3pi+ 2040 User's Guide](https://www.pololu.com/docs/0J86) — *Official documentation for robot assembly and pinout.*
-* [Control Board Schematic](https://www.pololu.com/file/0J1833/3pi-plus-2040-control-board-schematic.pdf) — *Detailed wiring for GPIO 25 (LED/Button A) and motor drivers.*
-* [ST LSM6DSO Datasheet](https://www.st.com/resource/en/datasheet/lsm6dso.pdf) — *Technical specifications for the 6-axis IMU.*
+Each top-level lab folder follows the same convention:
 
-## 🔗 Lab Instructions & LF Resources
-* [Lingua Franca (LF) Documentation](https://www.lf-lang.org/)
-* [Embedded Lab 04: Interfacing with Sensors](https://www.lf-lang.org/embedded-lab/Sensors.html)
-* [Embedded Lab 05: Peripherals & MMIO](https://www.lf-lang.org/embedded-lab/Peripherals.html)
-* [Embedded Lab 06: Interrupts & Modal Behavior](https://www.lf-lang.org/embedded-lab/Interrupts.html)
-* [Embedded Lab 08: Hill Climb Challenge](https://www.lf-lang.org/embedded-lab/Hill.html)
+- `src/`: Lingua Franca source files for that lab.
+- `report/`: submitted report files.
+- `submission/`: original packaged course submission archives.
+- `notes/`: working notes or experimental code captured during development.
 
----
-*Developed as part of the Graduate Embedded Systems Curriculum at Arizona State University.*
+Lab 5 is not present in this repository; the checked-in coursework artifacts jump from Lab 4 to Lab 6.
+
+## Lab Index
+
+| Lab | Focus | Primary source files |
+| --- | --- | --- |
+| Lab 1 | Toolchain, LEDs, and printf output | `LED.lf`, `ToolsBlinkSolution.lf`, `ToolsLEDSolution.lf`, `ToolsPrintfSolution.lf` |
+| Lab 2 | IMU and tilt sensing | `Tilt.lf`, `SensorsTiltSolution.lf` |
+| Lab 3 | Peripherals and direct MMIO access | `PeripheralsButtonSolution.lf`, `PeripheralsDirectSolution.lf` |
+| Lab 4 | Interrupts, debounce, actions, and modes | `InterruptActionSolution.lf`, `InterruptCallbackSolution.lf`, `InterruptDebouncedSolution.lf`, `InterruptModalSolution.lf` |
+| Lab 6 | Hill climbing, line detection, and line avoidance | `HillClimbSolution.lf`, `HillLineDetectSolution.lf`, `HillLineAvoidSolution.lf` |
+| Lab 7 | Track following with proportional steering | `TrackFollowSolution.lf` |
+
+## Building And Flashing
+
+The `.lf` files are intended for the Lingua Franca embedded lab environment and depend on the support reactors imported as `lib/*.lf` in that environment. To build one solution, use an LF/Pico workspace where those library imports resolve.
+
+Example workflow after copying a solution into an LF/Pico workspace:
+
+```sh
+lfc src/TrackFollowSolution.lf
+picotool load -x bin/TrackFollowSolution.elf
+```
+
+For example, `lab-07-line-tracking/src/TrackFollowSolution.lf` can be copied into `lf-pico/src/` before running the commands above. Alternatively, adjust the import paths so `lib/Line.lf`, `lib/Motors.lf`, `lib/Display.lf`, `lib/IMU.lf`, and related support reactors are visible.
+
+## References
+
+- [Pololu 3pi+ 2040 User's Guide](https://www.pololu.com/docs/0J86)
+- [Pololu 3pi+ 2040 Control Board Schematic](https://www.pololu.com/file/0J1833/3pi-plus-2040-control-board-schematic.pdf)
+- [ST LSM6DSO Datasheet](https://www.st.com/resource/en/datasheet/lsm6dso.pdf)
+- [Lingua Franca Documentation](https://www.lf-lang.org/)
+- [Lingua Franca Embedded Labs](https://www.lf-lang.org/embedded-lab/)
+
+## Coursework Note
+
+This repository began as an ASU lab submission archive. The current layout preserves the submitted artifacts while making the project easier to browse, review, and extend as a robotics firmware portfolio.

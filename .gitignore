@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Lingua Franca / embedded build outputs
+bin/
+build/
+src-gen/
+target/
+*.elf
+*.uf2
+*.hex
+*.map
+
+# Editor state
+.vscode/
+.idea/
